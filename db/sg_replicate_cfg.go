@@ -6,6 +6,7 @@ import (
 	"errors"
 	"expvar"
 	"fmt"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -560,10 +561,7 @@ func (m *sgReplicateManager) RefreshReplicationCfg() error {
 				base.Warnf("Unable to gracefully close active replication: %v", err)
 			}
 			if !ok {
-				purgeErr := activeReplicator.purgeStatus()
-				if purgeErr != nil {
-					base.Warnf("Unable to purge replication status for removed replication: %v", err)
-				}
+				activeReplicator.purgeCheckpoints()
 			}
 			delete(m.activeReplicators, replicationID)
 
@@ -1022,22 +1020,54 @@ func (a NodesByReplicationCount) Less(i, j int) bool {
 
 // ReplicationStatus is used by the _replicationStatus REST API endpoints
 type ReplicationStatus struct {
-	ID               string             `json:"replication_id"`
-	DocsRead         int64              `json:"docs_read"`
-	DocsWritten      int64              `json:"docs_written"`
-	DocsPurged       int64              `json:"docs_purged,omitempty"`
-	DocWriteFailures int64              `json:"doc_write_failures"`
-	DocWriteConflict int64              `json:"doc_write_conflict"`
-	Status           string             `json:"status"`
-	RejectedRemote   int64              `json:"rejected_by_remote"`
-	RejectedLocal    int64              `json:"rejected_by_local"`
-	LastSeqPull      string             `json:"last_seq_pull,omitempty"`
-	LastSeqPush      string             `json:"last_seq_push,omitempty"`
-	ErrorMessage     string             `json:"error_message,omitempty"`
-	DeltasSent       int64              `json:"deltas_sent,omitempty"`
-	DeltasRecv       int64              `json:"deltas_recv,omitempty"`
-	DeltasRequested  int64              `json:"deltas_requested,omitempty"`
-	Config           *ReplicationConfig `json:"config,omitempty"`
+	ID string `json:"replication_id"`
+	PullReplicationStatus
+	PushReplicationStatus
+	Config       *ReplicationConfig `json:"config,omitempty"`
+	Status       string             `json:"status"`
+	ErrorMessage string             `json:"error_message,omitempty"`
+}
+
+type PullReplicationStatus struct {
+	DocsRead        int64  `json:"docs_read,omitempty"`
+	DocsPurged      int64  `json:"docs_purged,omitempty"`
+	RejectedLocal   int64  `json:"rejected_by_local,omitempty"`
+	LastSeqPull     string `json:"last_seq_pull,omitempty"`
+	DeltasRecv      int64  `json:"deltas_recv,omitempty"`
+	DeltasRequested int64  `json:"deltas_requested,omitempty"`
+}
+
+type PushReplicationStatus struct {
+	DocsWritten      int64  `json:"docs_written,omitempty"`
+	DocWriteFailures int64  `json:"doc_write_failures,omitempty"`
+	DocWriteConflict int64  `json:"doc_write_conflict,omitempty"`
+	RejectedRemote   int64  `json:"rejected_by_remote,omitempty"`
+	LastSeqPush      string `json:"last_seq_push,omitempty"`
+	DeltasSent       int64  `json:"deltas_sent,omitempty"`
+}
+
+// Add adds the value of all counter stats in other to ReplicationStatus
+func (rs *PullReplicationStatus) Add(other PullReplicationStatus) {
+	if rs == nil {
+		return
+	}
+	rs.DocsRead += other.DocsRead
+	rs.DocsPurged += other.DocsPurged
+	rs.RejectedLocal += other.RejectedLocal
+	rs.DeltasRecv += other.DeltasRecv
+	rs.DeltasRequested += other.DeltasRequested
+}
+
+// Add adds the value of all counter stats in other to ReplicationStatus
+func (rs *PushReplicationStatus) Add(other PushReplicationStatus) {
+	if rs == nil {
+		return
+	}
+	rs.DocsWritten += other.DocsWritten
+	rs.DocWriteFailures += other.DocWriteFailures
+	rs.DocWriteConflict += other.DocWriteConflict
+	rs.RejectedRemote += other.RejectedRemote
+	rs.DeltasSent += other.DeltasSent
 }
 
 type ReplicationStatusOptions struct {
@@ -1063,6 +1093,7 @@ func (m *sgReplicateManager) GetReplicationStatus(replicationID string, options 
 	replication, isLocal := m.activeReplicators[replicationID]
 	m.activeReplicatorsLock.RUnlock()
 
+	log.Printf("Getting replication status (%s), isLocal: %v", replicationID, isLocal)
 	if options.LocalOnly && !isLocal {
 		return nil, nil
 	}
@@ -1171,20 +1202,6 @@ func (m *sgReplicateManager) GetReplicationStatusAll(options ReplicationStatusOp
 	}
 
 	return statuses, nil
-}
-
-func (m *sgReplicateManager) PublishReplicationStatus() {
-	m.activeReplicatorsLock.RLock()
-	defer m.activeReplicatorsLock.RUnlock()
-	for replicationID, replicator := range m.activeReplicators {
-		state, _ := replicator.State()
-		if state == ReplicationStateRunning {
-			err := replicator.publishStatus()
-			if err != nil {
-				base.WarnfCtx(m.loggingCtx, "Unable to publish replication status for replication %q: %v", replicationID, err)
-			}
-		}
-	}
 }
 
 // ImportHeartbeatListener uses replication cfg to manage node list

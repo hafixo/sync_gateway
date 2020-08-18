@@ -5,9 +5,12 @@ import (
 	"crypto/tls"
 	"encoding/base64"
 	"fmt"
+	"log"
 	"net/http"
 	"net/url"
 	"time"
+
+	"github.com/pkg/errors"
 
 	"github.com/couchbase/go-blip"
 	"github.com/couchbase/sync_gateway/base"
@@ -15,7 +18,7 @@ import (
 )
 
 const (
-	defaultCheckpointInterval    = time.Second * 30
+	defaultCheckpointInterval    = time.Second * 5
 	defaultPublishStatusInterval = time.Second * 10
 )
 
@@ -78,8 +81,6 @@ func (ar *ActiveReplicator) Start() error {
 		return pullErr
 	}
 
-	_ = ar.publishStatus()
-
 	return nil
 }
 
@@ -107,7 +108,6 @@ func (ar *ActiveReplicator) Stop() error {
 		return pullErr
 	}
 
-	_ = ar.publishStatus()
 	return nil
 }
 
@@ -130,10 +130,6 @@ func (ar *ActiveReplicator) Reset() error {
 		return pullErr
 	}
 
-	err := ar.purgeStatus()
-	if err != nil {
-		base.Warnf("Unable to purge replication status for reset replication: %v", err)
-	}
 	return nil
 }
 
@@ -149,7 +145,6 @@ func (ar *ActiveReplicator) _onReplicationComplete() {
 	}
 
 	if allReplicationsComplete {
-		_ = ar.publishStatus()
 		ar.config.onComplete(ar.ID)
 	}
 
@@ -158,6 +153,7 @@ func (ar *ActiveReplicator) _onReplicationComplete() {
 func (ar *ActiveReplicator) State() (state string, errorMessage string) {
 
 	state = ReplicationStateStopped
+	log.Printf("Getting state, %v %v", ar.Push, ar.Pull)
 	if ar.Push != nil {
 		state, errorMessage = ar.Push.getStateWithErrorMessage()
 	}
@@ -175,30 +171,21 @@ func (ar *ActiveReplicator) State() (state string, errorMessage string) {
 
 func (ar *ActiveReplicator) GetStatus() *ReplicationStatus {
 
+	log.Printf("Getting status for active replicator")
 	status := &ReplicationStatus{
 		ID: ar.ID,
 	}
 	status.Status, status.ErrorMessage = ar.State()
 
 	if ar.Pull != nil {
-		pullStats := ar.Pull.replicationStats
-		status.DocsRead = pullStats.HandleRevCount.Value()
-		status.DocsPurged = pullStats.HandleRevDocsPurgedCount.Value()
-		status.RejectedLocal = pullStats.HandleRevErrorCount.Value()
-		status.DeltasRecv = pullStats.HandleRevDeltaRecvCount.Value()
-		status.DeltasRequested = pullStats.HandleChangesDeltaRequestedCount.Value()
+		status.PullReplicationStatus = ar.Pull.GetStatus().PullReplicationStatus
 		if ar.Pull.Checkpointer != nil {
 			status.LastSeqPull = ar.Pull.Checkpointer.calculateSafeProcessedSeq()
 		}
 	}
 
 	if ar.Push != nil {
-		pushStats := ar.Push.replicationStats
-		status.DocsWritten = pushStats.SendRevCount.Value()
-		status.DocWriteFailures = pushStats.SendRevErrorTotal.Value()
-		status.DocWriteConflict = pushStats.SendRevErrorConflictCount.Value()
-		status.RejectedRemote = pushStats.SendRevErrorRejectedCount.Value()
-		status.DeltasSent = pushStats.SendRevDeltaSentCount.Value()
+		status.PushReplicationStatus = ar.Push.GetStatus().PushReplicationStatus
 		if ar.Push.Checkpointer != nil {
 			status.LastSeqPush = ar.Push.Checkpointer.calculateSafeProcessedSeq()
 		}
@@ -307,25 +294,47 @@ func combinedState(state1, state2 string) (combinedState string) {
 	return state1
 }
 
-func (ar *ActiveReplicator) publishStatus() error {
-	status := ar.GetStatus()
-	base.Debugf(base.KeyReplicate, "Persisting replication status for replicationID %v (%v)", ar.ID, ar.statusKey)
-	err := ar.config.ActiveDB.Bucket.Set(ar.statusKey, 0, status)
-	return err
-}
+func (ar *ActiveReplicator) purgeCheckpoints() error {
 
-func (ar *ActiveReplicator) purgeStatus() error {
-	base.Debugf(base.KeyReplicate, "Purging replication status for replicationID %v (%v)", ar.ID, ar.statusKey)
-	err := ar.config.ActiveDB.Bucket.Delete(ar.statusKey)
-	if !base.IsKeyNotFoundError(ar.config.ActiveDB.Bucket, err) {
-		return err
+	if ar.Pull != nil {
+		_ = ar.Pull.reset()
 	}
+
+	if ar.Push != nil {
+		_ = ar.Push.reset()
+	}
+
 	return nil
 }
 
+// LoadReplicationStatus attempts to load both push and pull replication checkpoints, and constructs the combined status
 func LoadReplicationStatus(dbContext *DatabaseContext, replicationID string) (status *ReplicationStatus, err error) {
-	_, err = dbContext.Bucket.Get(replicationStatusKey(replicationID), &status)
-	return status, err
+
+	status = &ReplicationStatus{
+		ID: replicationID,
+	}
+
+	pullCheckpoint, _ := getLocalCheckpoint(dbContext, PullCheckpointID(replicationID))
+	if pullCheckpoint != nil {
+		status.PullReplicationStatus = pullCheckpoint.Status.PullReplicationStatus
+		status.Status = pullCheckpoint.Status.Status
+		status.ErrorMessage = pullCheckpoint.Status.ErrorMessage
+		status.LastSeqPull = pullCheckpoint.Status.LastSeqPull
+	}
+
+	pushCheckpoint, _ := getLocalCheckpoint(dbContext, PushCheckpointID(replicationID))
+	if pushCheckpoint != nil {
+		status.PushReplicationStatus = pullCheckpoint.Status.PushReplicationStatus
+		status.Status = pushCheckpoint.Status.Status
+		status.ErrorMessage = pushCheckpoint.Status.ErrorMessage
+		status.LastSeqPush = pullCheckpoint.Status.LastSeqPush
+	}
+
+	if pullCheckpoint == nil && pushCheckpoint == nil {
+		return nil, errors.New("Replication status not found")
+	}
+
+	return status, nil
 }
 
 // replicationStatusKey generates the key used to store status information for the given replicationID.  If replicationID
@@ -338,4 +347,12 @@ func replicationStatusKey(replicationID string) string {
 		statusKeyID = base.Sha1HashString(replicationID, "")
 	}
 	return fmt.Sprintf("%s%s", base.SGRStatusPrefix, statusKeyID)
+}
+
+func PushCheckpointID(replicationID string) string {
+	return "sgr2cp:push:" + replicationID
+}
+
+func PullCheckpointID(replicationID string) string {
+	return "sgr2cp:pull:" + replicationID
 }

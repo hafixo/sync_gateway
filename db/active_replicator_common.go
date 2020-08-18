@@ -19,8 +19,10 @@ type activeReplicatorCommon struct {
 	Checkpointer          *Checkpointer
 	checkpointerCtx       context.Context
 	checkpointerCtxCancel context.CancelFunc
+	initialStatus         *ReplicationStatus
 	state                 string
 	lastError             error
+	stateErrorLock        sync.RWMutex // state and lastError share their own mutex to support retrieval while holding the main lock
 	replicationStats      *BlipSyncStats
 	onReplicatorComplete  ReplicatorCompleteFunc
 	lock                  sync.RWMutex
@@ -31,8 +33,10 @@ type ReplicatorCompleteFunc func()
 // setErrorState updates state and lastError, and
 // returns the error provided.  Expects callers to be holding
 // a.lock
-func (a *activeReplicatorCommon) _setError(err error) (passThrough error) {
+func (a *activeReplicatorCommon) setError(err error) (passThrough error) {
 	base.Infof(base.KeyReplicate, "ActiveReplicator had error state set with err: %v", err)
+	a.stateErrorLock.Lock()
+	defer a.stateErrorLock.Unlock()
 	a.state = ReplicationStateError
 	a.lastError = err
 	return err
@@ -40,26 +44,28 @@ func (a *activeReplicatorCommon) _setError(err error) (passThrough error) {
 
 // setState updates replicator state and resets lastError to nil.  Expects callers
 // to be holding a.lock
-func (a *activeReplicatorCommon) _setState(state string) {
+func (a *activeReplicatorCommon) setState(state string) {
+	a.stateErrorLock.Lock()
+	defer a.stateErrorLock.Unlock()
 	a.state = state
 	a.lastError = nil
 }
 
 func (a *activeReplicatorCommon) getState() string {
-	a.lock.RLock()
-	defer a.lock.RUnlock()
+	a.stateErrorLock.RLock()
+	defer a.stateErrorLock.RUnlock()
 	return a.state
 }
 
 func (a *activeReplicatorCommon) getLastError() error {
-	a.lock.RLock()
-	defer a.lock.RUnlock()
+	a.stateErrorLock.RLock()
+	defer a.stateErrorLock.RUnlock()
 	return a.lastError
 }
 
 func (a *activeReplicatorCommon) getStateWithErrorMessage() (state string, lastErrorMessage string) {
-	a.lock.RLock()
-	defer a.lock.RUnlock()
+	a.stateErrorLock.RLock()
+	defer a.stateErrorLock.RUnlock()
 	if a.lastError == nil {
 		return a.state, ""
 	} else {

@@ -556,8 +556,9 @@ func TestReplicationRebalancePull(t *testing.T) {
 
 	// Create pull replications, verify running
 	activeRT.createReplication("rep_ABC", remoteURLString, db.ActiveReplicatorTypePull, []string{"ABC"}, true)
-	activeRT.assertReplicationState("rep_ABC", db.ReplicationStateRunning)
 	activeRT.createReplication("rep_DEF", remoteURLString, db.ActiveReplicatorTypePull, []string{"DEF"}, true)
+	activeRT.waitForAssignedReplications(2)
+	activeRT.assertReplicationState("rep_ABC", db.ReplicationStateRunning)
 	activeRT.assertReplicationState("rep_DEF", db.ReplicationStateRunning)
 
 	// wait for documents originally written to remoteRT to arrive at activeRT
@@ -570,6 +571,9 @@ func TestReplicationRebalancePull(t *testing.T) {
 	docDEF1Body := activeRT.getDoc(docDEF1)
 	assert.Equal(t, "remoteRT", docDEF1Body["source"])
 
+	// wait for checkpoint persistence
+	time.Sleep(5 * time.Second)
+
 	// Add another node to the active cluster
 	activeRT2 := addActiveRT(t, activeRT.TestBucket)
 	defer activeRT2.Close()
@@ -577,6 +581,8 @@ func TestReplicationRebalancePull(t *testing.T) {
 	// Wait for replication to be rebalanced to activeRT2
 	activeRT.waitForAssignedReplications(1)
 	activeRT2.waitForAssignedReplications(1)
+
+	log.Printf("==============replication rebalance is done================")
 
 	// Create additional docs on remoteRT
 	docABC2 := t.Name() + "ABC2"
@@ -597,6 +603,22 @@ func TestReplicationRebalancePull(t *testing.T) {
 	assert.Equal(t, "remoteRT", docABC2Body2["source"])
 	docDEF2Body2 := activeRT2.getDoc(docDEF2)
 	assert.Equal(t, "remoteRT", docDEF2Body2["source"])
+
+	// Wait for replication persistence again
+	time.Sleep(6 * time.Second)
+
+	// Validate replication stats across rebalance, on both active nodes
+	log.Printf("Validation cross-rebalance stats")
+	abcStatus1 := activeRT.GetReplicationStatus("rep_ABC")
+	assert.Equal(t, int64(2), abcStatus1.DocsRead)
+	defStatus1 := activeRT.GetReplicationStatus("rep_DEF")
+	assert.Equal(t, int64(2), defStatus1.DocsRead)
+
+	abcStatus2 := activeRT2.GetReplicationStatus("rep_ABC")
+	assert.Equal(t, int64(2), abcStatus2.DocsRead)
+	defStatus2 := activeRT2.GetReplicationStatus("rep_DEF")
+	assert.Equal(t, int64(2), defStatus2.DocsRead)
+
 }
 
 // TestReplicationRebalancePush
@@ -678,7 +700,7 @@ func TestPullOneshotReplicationAPI(t *testing.T) {
 	if base.GTestBucketPool.NumUsableBuckets() < 2 {
 		t.Skipf("test requires at least 2 usable test buckets")
 	}
-	defer base.SetUpTestLogging(base.LevelInfo, base.KeyReplicate, base.KeyHTTP, base.KeyHTTPResp, base.KeySync, base.KeySyncMsg)()
+	defer base.SetUpTestLogging(base.LevelDebug, base.KeyReplicate, base.KeyHTTP, base.KeyHTTPResp, base.KeySync, base.KeySyncMsg)()
 
 	activeRT, remoteRT, remoteURLString, teardown := setupSGRPeers(t)
 	defer teardown()
@@ -705,7 +727,10 @@ func TestPullOneshotReplicationAPI(t *testing.T) {
 	doc1Body := activeRT.getDoc(docIDs[0])
 	assert.Equal(t, "rt2", doc1Body["source"])
 
-	// Get replication status from active
+	// Wait for replication to stop
+	activeRT.waitForReplicationStatus(replicationID, db.ReplicationStateStopped)
+
+	// Validate docs read from active
 	status := activeRT.GetReplicationStatus(replicationID)
 	assert.Equal(t, int64(docCount), status.DocsRead)
 
@@ -831,6 +856,14 @@ func (rt *RestTester) waitForAssignedReplications(count int) {
 	successFunc := func() bool {
 		replicationStatuses := rt.GetReplicationStatuses("?localOnly=true")
 		return len(replicationStatuses) == count
+	}
+	require.NoError(rt.tb, rt.WaitForCondition(successFunc))
+}
+
+func (rt *RestTester) waitForReplicationStatus(replicationID string, targetStatus string) {
+	successFunc := func() bool {
+		status := rt.GetReplicationStatus(replicationID)
+		return status.Status == targetStatus
 	}
 	require.NoError(rt.tb, rt.WaitForCondition(successFunc))
 }
