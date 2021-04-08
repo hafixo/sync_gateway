@@ -30,7 +30,7 @@ RUN ./build.sh -v
 
 
 # Stage to run the SG binary from the previous stage
-FROM ubuntu:latest as runner
+FROM ubuntu:rolling as runner
 
 ARG SG_FILENAME=sync_gateway_ce
 
